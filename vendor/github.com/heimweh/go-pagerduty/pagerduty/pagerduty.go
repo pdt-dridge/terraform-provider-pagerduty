@@ -51,12 +51,20 @@ type Client struct {
 	BusinessServices    *BusinessServiceService
 	ServiceDependencies *ServiceDependencyService
 	Priorities          *PriorityService
+	ResponsePlays       *ResponsePlayService
 }
 
 // Response is a wrapper around http.Response
 type Response struct {
 	Response  *http.Response
 	BodyBytes []byte
+}
+
+// RequestOptions is an object to setting options for HTTP requests
+type RequestOptions struct {
+	Type  string
+	Label string
+	Value string
 }
 
 // NewClient returns a new PagerDuty API client.
@@ -98,11 +106,12 @@ func NewClient(config *Config) (*Client, error) {
 	c.BusinessServices = &BusinessServiceService{c}
 	c.ServiceDependencies = &ServiceDependencyService{c}
 	c.Priorities = &PriorityService{c}
+	c.ResponsePlays = &ResponsePlayService{c}
 
 	return c, nil
 }
 
-func (c *Client) newRequest(method, url string, body interface{}) (*http.Request, error) {
+func (c *Client) newRequest(method, url string, body interface{}, options ...RequestOptions) (*http.Request, error) {
 	var buf io.ReadWriter
 	if body != nil {
 		buf = new(bytes.Buffer)
@@ -123,6 +132,13 @@ func (c *Client) newRequest(method, url string, body interface{}) (*http.Request
 		return nil, err
 	}
 
+	if len(options) > 0 {
+		for _, o := range options {
+			if o.Type == "header" {
+				req.Header.Add(o.Label, o.Value)
+			}
+		}
+	}
 	req.Header.Add("Accept", "application/vnd.pagerduty+json;version=2")
 	req.Header.Add("Authorization", fmt.Sprintf("Token token=%s", c.Config.Token))
 	req.Header.Add("Content-Type", "application/json")
@@ -130,13 +146,12 @@ func (c *Client) newRequest(method, url string, body interface{}) (*http.Request
 	if c.Config.UserAgent != "" {
 		req.Header.Add("User-Agent", c.Config.UserAgent)
 	}
-
 	return req, nil
 }
 
-func (c *Client) newRequestDo(method, url string, options, body, v interface{}) (*Response, error) {
-	if options != nil {
-		values, err := query.Values(options)
+func (c *Client) newRequestDo(method, url string, qryOptions, body, v interface{}) (*Response, error) {
+	if qryOptions != nil {
+		values, err := query.Values(qryOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -146,6 +161,24 @@ func (c *Client) newRequestDo(method, url string, options, body, v interface{}) 
 		}
 	}
 	req, err := c.newRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	return c.do(req, v)
+}
+
+func (c *Client) newRequestDoOptions(method, url string, qryOptions, body, v interface{}, reqOptions ...RequestOptions) (*Response, error) {
+	if qryOptions != nil {
+		values, err := query.Values(qryOptions)
+		if err != nil {
+			return nil, err
+		}
+
+		if v := values.Encode(); v != "" {
+			url = fmt.Sprintf("%s?%s", url, v)
+		}
+	}
+	req, err := c.newRequest(method, url, body, reqOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +228,7 @@ type ListResp struct {
 // a specific slice. The responseHandler is responsible for closing the response.
 type responseHandler func(response *Response) (ListResp, *Response, error)
 
-func (c *Client) newRequestPagedGetDo(basePath string, handler responseHandler) error {
+func (c *Client) newRequestPagedGetDo(basePath string, handler responseHandler, reqOptions ...RequestOptions) error {
 	// Indicates whether there are still additional pages associated with request.
 	var stillMore bool
 
@@ -204,7 +237,7 @@ func (c *Client) newRequestPagedGetDo(basePath string, handler responseHandler) 
 
 	// While there are more pages, keep adjusting the offset to get all results.
 	for stillMore, nextOffset = true, 0; stillMore; {
-		response, err := c.newRequestDo("GET", fmt.Sprintf("%s?offset=%d", basePath, nextOffset), nil, nil, nil)
+		response, err := c.newRequestDoOptions("GET", fmt.Sprintf("%s?offset=%d", basePath, nextOffset), nil, nil, nil, reqOptions...)
 		if err != nil {
 			return err
 		}
