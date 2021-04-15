@@ -43,7 +43,6 @@ func resourcePagerDutySchedule() *schema.Resource {
 			"layer": {
 				Type:     schema.TypeList,
 				Required: true,
-				ForceNew: true,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"id": {
@@ -58,18 +57,24 @@ func resourcePagerDutySchedule() *schema.Resource {
 						},
 
 						"start": {
-							Type:     schema.TypeString,
-							Required: true,
+							Type:             schema.TypeString,
+							Required:         true,
+							ValidateFunc:     validateRFC3339,
+							DiffSuppressFunc: suppressRFC3339Diff,
 						},
 
 						"end": {
-							Type:     schema.TypeString,
-							Optional: true,
+							Type:             schema.TypeString,
+							Optional:         true,
+							ValidateFunc:     validateRFC3339,
+							DiffSuppressFunc: suppressRFC3339Diff,
 						},
 
 						"rotation_virtual_start": {
-							Type:     schema.TypeString,
-							Required: true,
+							Type:             schema.TypeString,
+							Required:         true,
+							ValidateFunc:     validateRFC3339,
+							DiffSuppressFunc: suppressRFC3339Diff,
 						},
 
 						"rotation_turn_length_seconds": {
@@ -177,20 +182,13 @@ func resourcePagerDutyScheduleRead(d *schema.ResourceData, meta interface{}) err
 			d.Set("name", schedule.Name)
 			d.Set("time_zone", schedule.TimeZone)
 			d.Set("description", schedule.Description)
-			// Here we override whatever `start` value we get back from the API
-			// and use what's in the configuration. This is to prevent a diff issue
-			// because we always get back a new `start` value from the PagerDuty API.
-			for _, sl := range schedule.ScheduleLayers {
-				for _, rsl := range d.Get("layer").([]interface{}) {
-					ssl := rsl.(map[string]interface{})
 
-					if sl.ID == ssl["id"].(string) {
-						sl.Start = ssl["start"].(string)
-					}
-				}
+			layers, err := flattenScheduleLayers(schedule.ScheduleLayers)
+			if err != nil {
+				return resource.NonRetryableError(err)
 			}
 
-			if err := d.Set("layer", flattenScheduleLayers(schedule.ScheduleLayers)); err != nil {
+			if err := d.Set("layer", layers); err != nil {
 				return resource.NonRetryableError(err)
 			}
 		}
@@ -213,16 +211,62 @@ func resourcePagerDutyScheduleUpdate(d *schema.ResourceData, meta interface{}) e
 		return err
 	}
 
-	o := &pagerduty.UpdateScheduleOptions{}
+	opts := &pagerduty.UpdateScheduleOptions{}
 
 	if v, ok := d.GetOk("overflow"); ok {
-		o.Overflow = v.(bool)
+		opts.Overflow = v.(bool)
+	}
+
+	// A schedule layer can never be removed but it can be ended.
+	// Here we determine which layer has been removed from the configuration
+	// and we mark it as ended. This is to avoid diff issues.
+
+	if d.HasChange("layer") {
+		oraw, nraw := d.GetChange("layer")
+
+		osl, err := expandScheduleLayers(oraw.([]interface{}))
+		if err != nil {
+			return err
+		}
+
+		nsl, err := expandScheduleLayers(nraw.([]interface{}))
+		if err != nil {
+			return err
+		}
+
+		// Checks to see if new schedule layers (nsl) include all old schedule layers (osl)
+		for _, o := range osl {
+			found := false
+			for _, n := range nsl {
+				// layer is found in both nsl and osl
+				if o.ID == n.ID {
+					found = true
+				}
+			}
+
+			// If layer is not found in new schedule layers (nsl) set end value for layer
+			if !found {
+				end, err := timeToUTC(time.Now().Format(time.RFC3339))
+				if err != nil {
+					return err
+				}
+				o.End = end.String()
+				schedule.ScheduleLayers = append(schedule.ScheduleLayers, o)
+			}
+		}
 	}
 
 	log.Printf("[INFO] Updating PagerDuty schedule: %s", d.Id())
 
-	if _, _, err := client.Schedules.Update(d.Id(), schedule, o); err != nil {
-		return err
+	retryErr := resource.Retry(2*time.Minute, func() *resource.RetryError {
+		if _, _, err := client.Schedules.Update(d.Id(), schedule, opts); err != nil {
+			return resource.RetryableError(err)
+		}
+		return nil
+	})
+	if retryErr != nil {
+		time.Sleep(2 * time.Second)
+		return retryErr
 	}
 
 	return nil
@@ -233,8 +277,20 @@ func resourcePagerDutyScheduleDelete(d *schema.ResourceData, meta interface{}) e
 
 	log.Printf("[INFO] Deleting PagerDuty schedule: %s", d.Id())
 
-	if _, err := client.Schedules.Delete(d.Id()); err != nil {
-		return err
+	// Retrying to give other resources (such as escalation policies) to delete
+	retryErr := resource.Retry(2*time.Minute, func() *resource.RetryError {
+		if _, err := client.Schedules.Delete(d.Id()); err != nil {
+			if isErrCode(err, 400) {
+				return resource.RetryableError(err)
+			}
+
+			return resource.NonRetryableError(err)
+		}
+		return nil
+	})
+	if retryErr != nil {
+		time.Sleep(2 * time.Second)
+		return retryErr
 	}
 
 	d.SetId("")
@@ -264,7 +320,7 @@ func expandScheduleLayers(v interface{}) ([]*pagerduty.ScheduleLayer, error) {
 			Name:                      rsl["name"].(string),
 			Start:                     rsl["start"].(string),
 			End:                       rsl["end"].(string),
-			RotationVirtualStart:      rvs,
+			RotationVirtualStart:      rvs.String(),
 			RotationTurnLengthSeconds: rsl["rotation_turn_length_seconds"].(int),
 		}
 
@@ -297,10 +353,23 @@ func expandScheduleLayers(v interface{}) ([]*pagerduty.ScheduleLayer, error) {
 	return scheduleLayers, nil
 }
 
-func flattenScheduleLayers(v []*pagerduty.ScheduleLayer) []map[string]interface{} {
+func flattenScheduleLayers(v []*pagerduty.ScheduleLayer) ([]map[string]interface{}, error) {
 	var scheduleLayers []map[string]interface{}
 
 	for _, sl := range v {
+		// A schedule layer can never be removed but it can be ended.
+		// Here we check each layer and if it has been ended we don't read it back
+		// because it's not relevant anymore.
+		if sl.End != "" {
+			end, err := timeToUTC(sl.End)
+			if err != nil {
+				return nil, err
+			}
+
+			if time.Now().UTC().After(end) {
+				continue
+			}
+		}
 		scheduleLayer := map[string]interface{}{
 			"id":                           sl.ID,
 			"name":                         sl.Name,
@@ -346,5 +415,5 @@ func flattenScheduleLayers(v []*pagerduty.ScheduleLayer) []map[string]interface{
 		resultReversed = append(resultReversed, scheduleLayers[i])
 	}
 
-	return resultReversed
+	return resultReversed, nil
 }
